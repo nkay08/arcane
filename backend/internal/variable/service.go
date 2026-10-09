@@ -86,6 +86,10 @@ func (s *VariableService) FileModeEnabled(ctx context.Context) bool {
 }
 
 func (s *VariableService) ListVariables(ctx context.Context) ([]env.GlobalVariable, error) {
+	if s.FileModeEnabled(ctx) {
+		return s.listFileModeVariablesInternal(ctx)
+	}
+
 	variables, err := s.loadVariablesInternal(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve global variables: %w", err)
@@ -94,6 +98,32 @@ func (s *VariableService) ListVariables(ctx context.Context) ([]env.GlobalVariab
 	result := make([]env.GlobalVariable, 0, len(variables))
 	for _, variable := range variables {
 		result = append(result, globalVariableToDTOInternal(variable))
+	}
+	return result, nil
+}
+
+// listFileModeVariablesInternal presents the .env.global file contents through
+// the variables API so the UI keeps showing the effective values while file
+// mode is enabled. IDs are synthesized from keys; the rows are not editable
+// (mutations are rejected while file mode is on).
+func (s *VariableService) listFileModeVariablesInternal(ctx context.Context) ([]env.GlobalVariable, error) {
+	vars, err := s.ReadLocalEnvFile(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve global variables: %w", err)
+	}
+
+	result := make([]env.GlobalVariable, 0, len(vars))
+	now := time.Now().UTC()
+	for _, variable := range vars {
+		result = append(result, env.GlobalVariable{
+			ID:              variable.Key,
+			Key:             variable.Key,
+			Value:           variable.Value,
+			IsSecret:        false,
+			AllEnvironments: true,
+			EnvironmentIDs:  nil,
+			CreatedAt:       now,
+		})
 	}
 	return result, nil
 }
