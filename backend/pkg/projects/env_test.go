@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -91,6 +92,33 @@ func TestLoadEnvironment_DoesNotCreateMissingGlobalEnvFile(t *testing.T) {
 
 	_, statErr := os.Stat(filepath.Join(projectsDir, GlobalEnvFileName))
 	assert.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+func TestLoadEnvironment_ExpandsInFileReferences(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectsDir := filepath.Join(tmpDir, "projects")
+	workdir := filepath.Join(projectsDir, "myproject")
+	require.NoError(t, os.MkdirAll(workdir, utils.DirPerm))
+
+	require.NoError(t, os.WriteFile(filepath.Join(projectsDir, GlobalEnvFileName), []byte(strings.Join([]string{
+		"DC_UID=1000",
+		"XDG_RUNTIME_DIR=/run/user/$DC_UID",
+		"DC_PATH_BASE=\"/home/data/server_base\"",
+		"DC_PATH_VOLUME_DIR=\"$DC_PATH_BASE/_volumes\"",
+		"DC_PATH_ENV_DIR=${DC_PATH_BASE}/_env",
+		"FORWARD=$LATER",
+		"LATER=late",
+	}, "\n")+"\n"), utils.FilePerm))
+
+	loader := NewEnvLoader(projectsDir, workdir, false)
+	envMap, _, err := loader.LoadEnvironment(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, "/run/user/1000", envMap["XDG_RUNTIME_DIR"])
+	assert.Equal(t, "/home/data/server_base/_volumes", envMap["DC_PATH_VOLUME_DIR"])
+	assert.Equal(t, "/home/data/server_base/_env", envMap["DC_PATH_ENV_DIR"])
+	// References must point at lines defined earlier in the same file.
+	assert.Equal(t, "", envMap["FORWARD"])
 }
 
 func TestWithTransientValidationEnvFile_PreservesExternalSymlink(t *testing.T) {

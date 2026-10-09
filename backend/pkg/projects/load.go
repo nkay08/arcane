@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/compose-spec/compose-go/v2/consts"
 	interp "github.com/compose-spec/compose-go/v2/interpolation"
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/template"
@@ -194,6 +195,18 @@ func LoadComposeProjectFromContent(ctx context.Context, opts projecttypes.Compos
 		maps.Copy(envMap, parsedEnv)
 	}
 	envMap["PWD"] = workingDir
+
+	// Match `docker compose`: COMPOSE_PROJECT_NAME defaults to the caller-provided
+	// project name and falls back to the working directory name.
+	if _, ok := envMap[consts.ComposeProjectName]; !ok {
+		name := strings.TrimSpace(opts.ProjectName)
+		if name == "" {
+			name = loader.NormalizeProjectName(filepath.Base(workingDir))
+		}
+		if name != "" {
+			envMap[consts.ComposeProjectName] = name
+		}
+	}
 
 	configFiles := []composetypes.ConfigFile{{Content: []byte(composeContent)}}
 	if strings.TrimSpace(opts.OverrideContent) != "" {
@@ -381,6 +394,20 @@ func LoadComposeProject(
 		fullEnvMap["PWD"] = absWorkdir
 	} else {
 		slog.WarnContext(ctx, "Failed to set PWD environment variable", "workdir", workdir, "error", absErr)
+	}
+
+	// COMPOSE_PROJECT_NAME defaults to the resolved project name and falls back
+	// to the project directory name, as `docker compose` does, so ${COMPOSE_PROJECT_NAME}
+	// references interpolate even when the caller cannot supply a project name.
+	// An explicit COMPOSE_PROJECT_NAME from the merged environment always wins.
+	if _, ok := fullEnvMap[consts.ComposeProjectName]; !ok {
+		name := projectName
+		if name == "" {
+			name = loader.NormalizeProjectName(filepath.Base(workdir))
+		}
+		if name != "" {
+			fullEnvMap[consts.ComposeProjectName] = name
+		}
 	}
 
 	// Deployment-relevant COMPOSE_* variables (COMPOSE_FILE, COMPOSE_PROFILES,
