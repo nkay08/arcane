@@ -232,6 +232,27 @@ func TestWriteLocalEnvFile_PreservesExistingFileMode(t *testing.T) {
 	require.Contains(t, string(content), "A=2")
 }
 
+func TestWriteLocalEnvFile_FileModeLeavesFileUntouched(t *testing.T) {
+	service, _, projectsDir := setupVariableServiceTest(t)
+	ctx := t.Context()
+
+	require.NoError(t, service.settingsService.UpdateSetting(ctx, "variablesFileMode", "true"))
+	require.True(t, service.FileModeEnabled(ctx))
+
+	envPath := filepath.Join(projectsDir, ".env.global")
+	content := "DC_PATH_BASE=/home/data/server_base\n"
+	require.NoError(t, os.WriteFile(envPath, []byte(content), 0o600))
+
+	require.NoError(t, service.WriteLocalEnvFile(ctx, []env.Variable{{Key: "OTHER", Value: "x"}}))
+
+	got, err := os.ReadFile(envPath)
+	require.NoError(t, err)
+	assert.Equal(t, content, string(got), "file mode must leave .env.global untouched")
+
+	_, err = service.CreateVariable(ctx, env.CreateGlobalVariableRequest{Key: "A", Value: "1"})
+	require.ErrorIs(t, err, common.ErrVariablesFileMode)
+}
+
 func TestSyncEnvironment_LocalWritesEnvGlobalFile(t *testing.T) {
 	service, _, projectsDir := setupVariableServiceTest(t)
 	ctx := t.Context()

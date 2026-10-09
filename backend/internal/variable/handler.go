@@ -182,7 +182,8 @@ func variableMutationHTTPErrorInternal(err error) error {
 		return huma.Error400BadRequest(err.Error())
 	case errors.Is(err, common.ErrGlobalVariableNotFound):
 		return huma.Error404NotFound(err.Error())
-	case errors.Is(err, common.ErrGlobalVariableConflict):
+	case errors.Is(err, common.ErrGlobalVariableConflict),
+		errors.Is(err, common.ErrVariablesFileMode):
 		return huma.Error409Conflict(err.Error())
 	default:
 		return huma.Error500InternalServerError(err.Error())

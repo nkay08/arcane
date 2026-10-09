@@ -55,6 +55,7 @@ var (
 	ErrUpdaterNoContainersMatched        = Classify(ErrBadRequest, errors.New("no compose-managed containers matched the requested resources"))
 	ErrTemplateNotFound                  = Classify(ErrNotFound, errors.New("Template not found"))
 	ErrInvalidEnvKey                     = Classify(ErrValidation, errors.New("Invalid environment key"))
+	ErrVariablesFileMode                 = Classify(ErrConflict, errors.New("Variables file mode is enabled; edit .env.global directly"))
 	ErrGlobalVariableNotFound            = Classify(ErrNotFound, errors.New("Global variable not found"))
 	ErrApnsDisabled                      = Classify(ErrForbidden, errors.New("Mobile push notifications are disabled"))
 	ErrApnsDeviceNotFound                = Classify(ErrNotFound, errors.New("Mobile push device not found"))
