@@ -21,7 +21,6 @@ import (
 
 	"github.com/getarcaneapp/arcane/types/v2/env"
 	"go.getarcane.app/acfs"
-	"go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/crypto"
 	"gorm.io/gorm"
 
@@ -78,6 +77,14 @@ func NewVariableService(db *database.DB, environmentService *environment.Environ
 	return service
 }
 
+// FileModeEnabled reports whether the .env.global file in the projects directory
+// is the single source of truth for the local environment. When enabled Arcane
+// reads the file for interpolation but never writes it: the legacy import,
+// local materialization, and variable mutations are all disabled.
+func (s *VariableService) FileModeEnabled(ctx context.Context) bool {
+	return s.settingsService.GetBoolSetting(ctx, "variablesFileMode", false)
+}
+
 func (s *VariableService) ListVariables(ctx context.Context) ([]env.GlobalVariable, error) {
 	variables, err := s.loadVariablesInternal(ctx)
 	if err != nil {
@@ -92,6 +99,10 @@ func (s *VariableService) ListVariables(ctx context.Context) ([]env.GlobalVariab
 }
 
 func (s *VariableService) CreateVariable(ctx context.Context, req env.CreateGlobalVariableRequest) (*env.GlobalVariable, error) {
+	if s.FileModeEnabled(ctx) {
+		return nil, common.Classify(common.ErrVariablesFileMode, errors.New("variables file mode is enabled; edit .env.global directly"))
+	}
+
 	key := strings.TrimSpace(req.Key)
 	if !envKeyPattern.MatchString(key) {
 		return nil, common.Classify(common.ErrInvalidEnvKey, fmt.Errorf("invalid env key %q (must match [A-Za-z_][A-Za-z0-9_]*)", key))
@@ -136,6 +147,10 @@ func (s *VariableService) CreateVariable(ctx context.Context, req env.CreateGlob
 }
 
 func (s *VariableService) UpdateVariable(ctx context.Context, id string, req env.UpdateGlobalVariableRequest) (*env.GlobalVariable, error) {
+	if s.FileModeEnabled(ctx) {
+		return nil, common.Classify(common.ErrVariablesFileMode, errors.New("variables file mode is enabled; edit .env.global directly"))
+	}
+
 	var variable GlobalVariable
 	if err := s.db.WithContext(ctx).Preload("Environments").First(&variable, "id = ?", id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -250,6 +265,10 @@ func (s *VariableService) resolveUpdatedScopeInternal(ctx context.Context, varia
 }
 
 func (s *VariableService) DeleteVariable(ctx context.Context, id string) error {
+	if s.FileModeEnabled(ctx) {
+		return common.Classify(common.ErrVariablesFileMode, errors.New("variables file mode is enabled; edit .env.global directly"))
+	}
+
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Delete(&GlobalVariable{}, "id = ?", id)
 		if result.Error != nil {
@@ -364,6 +383,11 @@ func (s *VariableService) syncTargetsInternal(ctx context.Context) []string {
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to list environments for global variable sync", "error", err)
 		envIDs = nil
+	}
+	if s.FileModeEnabled(ctx) {
+		// The local .env.global is the source of truth; never materialize the
+		// database set into it. Remote environments keep receiving pushes.
+		return slices.DeleteFunc(envIDs, func(id string) bool { return id == environment.LocalEnvironmentID })
 	}
 	if !slices.Contains(envIDs, environment.LocalEnvironmentID) {
 		envIDs = append([]string{environment.LocalEnvironmentID}, envIDs...)
@@ -536,6 +560,11 @@ func (s *VariableService) WriteLocalEnvFile(ctx context.Context, vars []env.Vari
 		return err
 	}
 
+	if s.FileModeEnabled(ctx) {
+		slog.DebugContext(ctx, "variables file mode enabled; leaving .env.global untouched", "path", envPath)
+		return nil
+	}
+
 	// The data directory is the confinement root for the write, so it is created
 	// through os before acfs opens it.
 	projectsDirectory := filepath.Dir(envPath)
@@ -586,6 +615,11 @@ func (s *VariableService) WriteLocalEnvFile(ctx context.Context, vars []env.Vari
 // as all-environment readable variables before the first materialization
 // overwrites the file. Runs once, guarded by a KV flag.
 func (s *VariableService) ImportLegacyLocalEnvFile(ctx context.Context) error {
+	if s.FileModeEnabled(ctx) {
+		slog.DebugContext(ctx, "variables file mode enabled; skipping legacy global variables import")
+		return nil
+	}
+
 	flag := globalVariablesImportedKVPrefix + environment.LocalEnvironmentID
 	imported, err := s.kvService.GetBool(ctx, flag, false)
 	if err != nil {
@@ -785,7 +819,7 @@ func replaceVariableScopeRowsInternal(tx *gorm.DB, variableID string, envIDs []s
 }
 
 func wrapVariableMutationErrorInternal(err error) error {
-	if err == nil || errors.Is(err, common.ErrGlobalVariableConflict) || errors.Is(err, common.ErrGlobalVariableNotFound) || errors.Is(err, common.ErrInvalidEnvKey) {
+	if err == nil || errors.Is(err, common.ErrGlobalVariableConflict) || errors.Is(err, common.ErrGlobalVariableNotFound) || errors.Is(err, common.ErrInvalidEnvKey) || errors.Is(err, common.ErrVariablesFileMode) {
 		return err
 	}
 	return fmt.Errorf("failed to update global variables: %w", err)
