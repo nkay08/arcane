@@ -251,6 +251,12 @@ func TestWriteLocalEnvFile_FileModeLeavesFileUntouched(t *testing.T) {
 
 	_, err = service.CreateVariable(ctx, env.CreateGlobalVariableRequest{Key: "A", Value: "1"})
 	require.ErrorIs(t, err, common.ErrVariablesFileMode)
+
+	listed, err := service.ListVariables(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 1, "UI must see the file contents in file mode")
+	assert.Equal(t, "DC_PATH_BASE", listed[0].Key)
+	assert.Equal(t, "/home/data/server_base", listed[0].Value)
 }
 
 func TestSyncEnvironment_LocalWritesEnvGlobalFile(t *testing.T) {
