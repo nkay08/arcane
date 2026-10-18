@@ -176,7 +176,7 @@ func (s *Service) startPatch(
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
-	if storeErr := requireContainerdImageStore(ctx, dockerClient); storeErr != nil {
+	if storeErr := s.requireImagePatchSupport(ctx, dockerClient); storeErr != nil {
 		return nil, nil, storeErr
 	}
 	imageInspect, err := dockerClient.ImageInspect(ctx, imageID)
@@ -848,8 +848,8 @@ func (s *Service) Targets(ctx context.Context, envID string) ([]Target, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
-	if storeErr := requireContainerdImageStore(ctx, dockerClient); storeErr != nil {
-		return nil, storeErr
+	if requireImagePatchSupportErr := s.requireImagePatchSupport(ctx, dockerClient); requireImagePatchSupportErr != nil {
+		return nil, requireImagePatchSupportErr
 	}
 	var scans []vulnerability.VulnerabilityScanRecord
 	if scansErr := s.db.WithContext(ctx).
@@ -896,6 +896,18 @@ func requireContainerdImageStore(ctx context.Context, dockerClient *client.Clien
 		}
 	}
 	return common.ErrPatchRequiresContainerdImageStore
+}
+
+// requireImagePatchSupport rejects engines that cannot run Copa before probing
+// the image store, so Podman users get a direct explanation instead of a Docker
+// daemon-configuration message.
+func (s *Service) requireImagePatchSupport(ctx context.Context, dockerClient *client.Client) error {
+	if s.dockerService != nil {
+		if engine, err := s.dockerService.Engine(ctx); err == nil && strings.EqualFold(strings.TrimSpace(engine.Name), "podman") {
+			return common.ErrPatchUnsupportedOnPodman
+		}
+	}
+	return requireContainerdImageStore(ctx, dockerClient)
 }
 
 func (s *Service) appendPatchActivity(ctx context.Context, activityID string, progress int, message string) {

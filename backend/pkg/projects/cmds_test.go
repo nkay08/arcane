@@ -2,6 +2,7 @@ package projects
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -156,6 +157,129 @@ func TestListGlobalComposeContainersUsesProvidedClient(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, containers, 1)
 	require.Equal(t, "abc123", containers[0].ID)
+}
+
+func TestMirrorPodmanComposeLabelsInternal(t *testing.T) {
+	proj := &composetypes.Project{
+		Name: "demo",
+		Services: composetypes.Services{
+			"web": {Name: "web"},
+			"db":  {Name: "db", CustomLabels: composetypes.Labels{"existing": "kept"}},
+		},
+	}
+
+	mirrorPodmanComposeLabelsInternal("demo", proj)
+
+	for _, name := range []string{"web", "db"} {
+		labels := proj.Services[name].CustomLabels
+		require.Equal(t, "demo", labels[podmanComposeProjectLabelInternal])
+		require.Equal(t, name, labels[podmanComposeServiceLabelInternal])
+		require.Equal(t, "podman-compose@demo.service", labels[podmanSystemdUnitLabelInternal])
+	}
+	require.Equal(t, "kept", proj.Services["db"].CustomLabels["existing"])
+}
+
+func TestPodmanComposeInvisibleInternal(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{name: "podman-compose container lacks config hash", labels: map[string]string{api.ProjectLabel: "demo"}, want: true},
+		{name: "compose v5 container carries config hash", labels: map[string]string{api.ConfigHashLabel: "abc"}, want: false},
+		{name: "compose hook runner is excluded by hook label", labels: map[string]string{api.HookLabel: "pre_start"}, want: false},
+		{name: "one-off container is excluded by one-off label", labels: map[string]string{api.OneoffLabel: "True"}, want: false},
+		{name: "non-one-off label without config hash is excluded", labels: map[string]string{api.OneoffLabel: "False"}, want: false},
+		{name: "no labels", labels: nil, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, podmanComposeInvisibleInternal(container.Summary{Labels: tt.labels}))
+		})
+	}
+}
+
+func TestRemoveInDependencyOrderInternalRemovesBlockedParentsAfterDependents(t *testing.T) {
+	dependent := container.Summary{ID: "dependent-container-id"}
+	parent := container.Summary{ID: "parent--container-id"}
+	removed := map[string]bool{}
+	remove := func(ctr container.Summary) error {
+		if ctr.ID == parent.ID && !removed[dependent.ID] {
+			return errors.New("container has dependent containers which must be removed before it")
+		}
+		removed[ctr.ID] = true
+		return nil
+	}
+
+	// Parent is offered first: the first pass blocks it, the next pass succeeds
+	// once the dependent is gone.
+	require.NoError(t, removeInDependencyOrderInternal([]container.Summary{parent, dependent}, remove))
+	require.True(t, removed[parent.ID])
+	require.True(t, removed[dependent.ID])
+}
+
+func TestRemoveInDependencyOrderInternalReportsRemainingAfterNoProgress(t *testing.T) {
+	ctr := container.Summary{ID: "blocked-container-id"}
+	remove := func(container.Summary) error {
+		return errors.New("has dependent containers which must be removed before it")
+	}
+
+	err := removeInDependencyOrderInternal([]container.Summary{ctr}, remove)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has dependent containers")
+}
+
+func TestProjectLabelMatchesInternal(t *testing.T) {
+	tests := []struct {
+		name        string
+		labels      map[string]string
+		projectName string
+		want        bool
+	}{
+		{name: "exact", labels: map[string]string{api.ProjectLabel: "demo"}, projectName: "demo", want: true},
+		{name: "case insensitive and trimmed", labels: map[string]string{api.ProjectLabel: "  Demo "}, projectName: "demo", want: true},
+		{name: "different project", labels: map[string]string{api.ProjectLabel: "other"}, projectName: "demo", want: false},
+		{name: "missing label", labels: nil, projectName: "demo", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, projectLabelMatchesInternal(tt.labels, tt.projectName))
+		})
+	}
+}
+
+func TestComposeContainerSummaryInternal(t *testing.T) {
+	summary := composeContainerSummaryInternal(container.Summary{
+		ID:     "abc123",
+		Names:  []string{"/demo_web_1"},
+		Image:  "nginx:alpine",
+		State:  container.StateRunning,
+		Status: "Up 2 minutes",
+		Labels: map[string]string{
+			api.ProjectLabel: "demo",
+			api.ServiceLabel: "web",
+		},
+		Ports:  []container.PortSummary{{PrivatePort: 80, PublicPort: 8080, Type: "tcp"}},
+		Health: &container.HealthSummary{Status: container.Healthy},
+	})
+
+	assert.Equal(t, "abc123", summary.ID)
+	assert.Equal(t, "demo_web_1", summary.Name)
+	assert.Equal(t, "nginx:alpine", summary.Image)
+	assert.Equal(t, "demo", summary.Project)
+	assert.Equal(t, "web", summary.Service)
+	assert.Equal(t, container.StateRunning, summary.State)
+	assert.Equal(t, container.Healthy, summary.Health)
+	assert.Equal(t, api.PortPublishers{{TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"}}, summary.Publishers)
+}
+
+func TestComposeContainerSummaryInternalWithoutHealth(t *testing.T) {
+	summary := composeContainerSummaryInternal(container.Summary{ID: "abc123", State: container.StateExited})
+
+	assert.Equal(t, container.HealthStatus(""), summary.Health)
+	assert.Empty(t, summary.Publishers)
 }
 
 func TestFormatDockerPorts(t *testing.T) {

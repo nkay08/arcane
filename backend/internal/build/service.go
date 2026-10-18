@@ -161,6 +161,9 @@ func (
 	} else {
 		cleanupResolvedContext = cleanupFn
 		result, err = s.builder.BuildImage(ctx, resolvedReq, writer, serviceName)
+		if err != nil {
+			err = s.explainBuildErrorInternal(ctx, err)
+		}
 	}
 
 	completedAt := time.Now()
@@ -278,6 +281,24 @@ func sanitizeBuildContextForEventInternal(raw string) string {
 		sanitized += "#" + fragment
 	}
 	return sanitized
+}
+
+// explainBuildErrorInternal replaces engine-specific build failures with an
+// actionable message. Podman exposes no Docker BuildKit session endpoint, so a
+// Dockerfile that needs one (a syntax frontend, or RUN --mount/--network/
+// --security, or COPY/ADD --link flags) fails inside BuildKit with no hint.
+func (s *BuildService) explainBuildErrorInternal(ctx context.Context, err error) error {
+	if err == nil || s.dockerService == nil {
+		return err
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "buildkit") {
+		return err
+	}
+	engine, engineErr := s.dockerService.Engine(ctx)
+	if engineErr != nil || !strings.EqualFold(strings.TrimSpace(engine.Name), "podman") {
+		return err
+	}
+	return fmt.Errorf("this build needs BuildKit features Podman's Docker-compatible build API does not provide (a Dockerfile syntax frontend, or RUN --mount/--network/--security, or COPY/ADD --link); build it with `podman build` or against a Docker host: %w", err)
 }
 
 func (s *BuildService) effectiveBuildProviderInternal(provider string) string {

@@ -1,3 +1,5 @@
+# Docker example for the Arcane manager. For Podman, see compose.podman.yaml —
+# the socket path and SELinux relabeling (:z) differ.
 services:
   arcane:
     image: ghcr.io/getarcaneapp/manager:latest

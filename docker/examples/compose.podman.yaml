@@ -1,0 +1,51 @@
+# Podman example for the Arcane manager.
+#
+# Arcane talks to the container engine over the Docker-compatible API, so the
+# same image runs on Podman. Two things differ from the Docker examples:
+#   1. the socket path — rootful: /run/podman/podman.sock,
+#      rootless: $XDG_RUNTIME_DIR/podman/podman.sock (usually
+#      /run/user/<uid>/podman/podman.sock); and
+#   2. SELinux hosts, where bind mounts need the :z relabel suffix.
+#
+# `podman compose` and `podman-compose` both read this file. The `cgroup: host`
+# key from the Docker examples is omitted on purpose: Podman's /run/.containerenv
+# marker already lets Arcane detect its own container.
+services:
+  arcane:
+    image: ghcr.io/getarcaneapp/manager:latest
+    container_name: arcane
+    ports:
+      - '3552:3552'
+    volumes:
+      # Rootful Podman. Mount the socket at /var/run/docker.sock so Arcane's
+      # default DOCKER_HOST keeps working. For rootless Podman, replace the
+      # source with "$XDG_RUNTIME_DIR/podman/podman.sock" (usually
+      # /run/user/<uid>/podman/podman.sock), or keep the real path and set
+      # DOCKER_HOST (see below).
+      - /run/podman/podman.sock:/var/run/docker.sock
+      - arcane-data:/app/data
+      # :z relabels the bind for SELinux hosts (Fedora/RHEL/CentOS) and is
+      # ignored where SELinux is not enforcing.
+      - /host/path/to/projects:/host/path/to/projects:z
+      - /host/path/to/builds:/builds:z
+    environment:
+      - ENCRYPTION_KEY=replace_me_with_a_random_32_char_value
+      - PROJECTS_DIRECTORY=/host/path/to/projects
+      # Rootless Podman: match the host user that owns the socket so the mounted
+      # socket is readable. Arcane also maps the socket's group automatically.
+      # - PUID=1000
+      # - PGID=1000
+      # Optional alternative to mounting the socket at /var/run/docker.sock:
+      # - DOCKER_HOST=unix:///run/user/1000/podman/podman.sock
+      # Timezone for cron job scheduling (e.g., America/New_York, Europe/London, UTC)
+      - TZ=UTC
+    healthcheck:
+      test: ['CMD', './arcane', 'health', '--timeout', '2s']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  arcane-data:

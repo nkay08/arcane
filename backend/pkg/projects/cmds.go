@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -17,7 +18,9 @@ import (
 	"github.com/moby/moby/api/types/registry"
 	"github.com/moby/moby/client"
 	"go.getarcane.app/docker"
+	"go.getarcane.app/docker/compat"
 	kit "go.getarcane.app/kit/pkg"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/timeouts"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
@@ -31,6 +34,15 @@ const defaultComposeTimeout = 30 * time.Minute
 // composeStopTimeoutSeconds is the container stop timeout used by the
 // podman-compose compat fallbacks.
 const composeStopTimeoutSeconds = 10
+
+// podman-compose stamps these labels on the containers it creates. Arcane
+// mirrors the ones it can authoritatively know so Podman tooling and
+// podman-compose see containers Arcane deploys.
+const (
+	podmanComposeProjectLabelInternal = "io.podman.compose.project"
+	podmanComposeServiceLabelInternal = "io.podman.compose.service"
+	podmanSystemdUnitLabelInternal    = "PODMAN_SYSTEMD_UNIT"
+)
 
 // detachFromHTTPContextInternal creates a new context derived from
 // context.WithoutCancel(parent) that carries any values from the parent
@@ -50,9 +62,27 @@ func detachFromHTTPContextInternal(parent context.Context, timeout time.Duration
 // filters can see the container. Those filters require the config-hash label,
 // which podman-compose does not set — its containers are invisible to the
 // compose service, so label-based lifecycle operations silently no-op on them.
+// Compose v5's own lifecycle-hook runners also omit the config-hash label, so
+// they are excluded by their hook label.
 func podmanComposeInvisibleInternal(c container.Summary) bool {
-	_, ok := c.Labels[api.ConfigHashLabel]
-	return !ok
+	return podmanComposeInvisibleLabelsInternal(c.Labels)
+}
+
+// podmanComposeInvisibleLabelsInternal is the label-level form of
+// podmanComposeInvisibleInternal, shared by networks and volumes whose summaries
+// expose labels without a container type. A container without the config-hash
+// label is invisible to compose v5; hook runners and one-off containers omit it
+// too but are not podman-compose creations, so they are excluded (podman-compose
+// never sets either the hook or the one-off label).
+func podmanComposeInvisibleLabelsInternal(labels map[string]string) bool {
+	if _, ok := labels[api.ConfigHashLabel]; ok {
+		return false
+	}
+	if _, ok := labels[api.HookLabel]; ok {
+		return false
+	}
+	_, hasOneOffLabel := labels[api.OneoffLabel]
+	return !hasOneOffLabel
 }
 
 // serviceSelectedInternal matches a container's service label against the
@@ -79,7 +109,7 @@ func (c *Client) projectContainersInternal(ctx context.Context, projectName stri
 	}
 	var out []container.Summary
 	for _, item := range list.Items {
-		if strings.EqualFold(item.Labels[api.ProjectLabel], projectName) {
+		if projectLabelMatchesInternal(item.Labels, projectName) {
 			out = append(out, item)
 		}
 	}
@@ -106,6 +136,41 @@ func (c *Client) stopAndRemoveContainerInternal(ctx context.Context, ctr contain
 	return nil
 }
 
+// removeContainersWithDependentsInternal force-removes a set of containers that
+// may depend on one another. The engine refuses to remove a container while a
+// dependent still exists (a shared network namespace, a link, or a Podman pod
+// member), so removal runs in passes: each pass clears whatever became
+// removable, and the pass that makes no progress reports the remainder.
+func (c *Client) removeContainersWithDependentsInternal(ctx context.Context, containers []container.Summary) error {
+	return removeInDependencyOrderInternal(containers, func(ctr container.Summary) error {
+		return c.stopAndRemoveContainerInternal(ctx, ctr)
+	})
+}
+
+func removeInDependencyOrderInternal(containers []container.Summary, remove func(container.Summary) error) error {
+	pending := containers
+	var lastErr error
+	for len(pending) > 0 {
+		var blocked []container.Summary
+		var errs []error
+		removedAny := false
+		for _, ctr := range pending {
+			if err := remove(ctr); err != nil {
+				blocked = append(blocked, ctr)
+				errs = append(errs, fmt.Errorf("remove container %s: %w", ctr.ID[:12], err))
+				continue
+			}
+			removedAny = true
+		}
+		lastErr = errors.Join(errs...)
+		if !removedAny {
+			break
+		}
+		pending = blocked
+	}
+	return lastErr
+}
+
 // removeInvisibleProjectContainersInternal force-removes project containers
 // compose v5 cannot see (podman-compose creations). ComposeDown relies on it:
 // v5's own down returns success while those containers keep running.
@@ -114,16 +179,62 @@ func (c *Client) removeInvisibleProjectContainersInternal(ctx context.Context, p
 	if err != nil {
 		return err
 	}
-	var errs []error
+	var invisible []container.Summary
 	for _, ctr := range containers {
-		if !podmanComposeInvisibleInternal(ctr) {
+		if podmanComposeInvisibleInternal(ctr) {
+			invisible = append(invisible, ctr)
+		}
+	}
+	return c.removeContainersWithDependentsInternal(ctx, invisible)
+}
+
+// removeInvisibleProjectNetworksInternal removes project networks compose v5
+// cannot see (podman-compose creations), which its Down leaves behind.
+func (c *Client) removeInvisibleProjectNetworksInternal(ctx context.Context, projectName string) error {
+	filter := make(client.Filters)
+	filter = filter.Add("label", api.ProjectLabel)
+	list, err := c.dockerCli.Client().NetworkList(ctx, client.NetworkListOptions{Filters: filter})
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, net := range list.Items {
+		if !podmanComposeInvisibleLabelsInternal(net.Labels) || !projectLabelMatchesInternal(net.Labels, projectName) {
 			continue
 		}
-		if err := c.stopAndRemoveContainerInternal(ctx, ctr); err != nil {
-			errs = append(errs, fmt.Errorf("remove invisible project container %s: %w", ctr.ID[:12], err))
+		if _, err := c.dockerCli.Client().NetworkRemove(ctx, net.ID, client.NetworkRemoveOptions{}); err != nil && !errdefs.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("remove invisible project network %s: %w", net.Name, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// removeInvisibleProjectVolumesInternal removes project volumes compose v5
+// cannot see (podman-compose creations) when the caller asked for volumes to go,
+// mirroring Down's RemoveVolumes semantics.
+func (c *Client) removeInvisibleProjectVolumesInternal(ctx context.Context, projectName string) error {
+	filter := make(client.Filters)
+	filter = filter.Add("label", api.ProjectLabel)
+	list, err := c.dockerCli.Client().VolumeList(ctx, client.VolumeListOptions{Filters: filter})
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, vol := range list.Items {
+		if !podmanComposeInvisibleLabelsInternal(vol.Labels) || !projectLabelMatchesInternal(vol.Labels, projectName) {
+			continue
+		}
+		if _, err := c.dockerCli.Client().VolumeRemove(ctx, vol.Name, client.VolumeRemoveOptions{}); err != nil && !errdefs.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("remove invisible project volume %s: %w", vol.Name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// projectLabelMatchesInternal compares a resource's compose project label to the
+// requested project name case-insensitively, matching projectContainersInternal.
+func projectLabelMatchesInternal(labels map[string]string, projectName string) bool {
+	return strings.EqualFold(strings.TrimSpace(labels[api.ProjectLabel]), projectName)
 }
 
 // stopInvisibleProjectServicesInternal stops invisible containers belonging to
@@ -170,36 +281,132 @@ func (c *Client) restartInvisibleProjectServicesInternal(ctx context.Context, pr
 	return errors.Join(errs...)
 }
 
-// removeInvisibleNameConflictsInternal removes invisible containers whose name
-// collides with a container_name the upcoming deploy is about to create.
-// Compose v5 cannot see those containers, so without this step create fails
-// with "name is already in use" instead of recreating them.
-func (c *Client) removeInvisibleNameConflictsInternal(ctx context.Context, projectName string, proj *composetypes.Project) error {
+// removeInvisibleContainerConflictsInternal removes the containers compose v5
+// cannot see (podman-compose creations) that the upcoming deploy would collide
+// with: every invisible container belonging to a service being created, plus
+// any whose name matches an explicit container_name. Without the service match
+// `up` creates a second set of containers under Docker's naming (project-service-1)
+// next to the podman-compose ones (project_service_1); without the name match it
+// fails with "name is already in use".
+func (c *Client) removeInvisibleContainerConflictsInternal(ctx context.Context, projectName string, proj *composetypes.Project) error {
 	containers, err := c.projectContainersInternal(ctx, projectName)
 	if err != nil {
 		return err
 	}
-	byName := make(map[string]container.Summary, len(containers))
+	selectedServices := make(map[string]struct{}, len(proj.Services))
+	containerNames := make(map[string]struct{}, len(proj.Services))
+	for _, svc := range proj.Services {
+		selectedServices[strings.ToLower(strings.TrimSpace(svc.Name))] = struct{}{}
+		if svc.ContainerName != "" {
+			containerNames[svc.ContainerName] = struct{}{}
+		}
+	}
+
+	var conflicts []container.Summary
 	for _, ctr := range containers {
 		if !podmanComposeInvisibleInternal(ctr) {
 			continue
 		}
-		if name := canonicalContainerNameInternal(ctr); name != "" {
-			byName[name] = ctr
+		_, serviceMatch := selectedServices[strings.ToLower(strings.TrimSpace(ctr.Labels[api.ServiceLabel]))]
+		_, nameMatch := containerNames[canonicalContainerNameInternal(ctr)]
+		if serviceMatch || nameMatch {
+			conflicts = append(conflicts, ctr)
 		}
 	}
-	var errs []error
-	for _, svc := range proj.Services {
-		if svc.ContainerName == "" {
+	return c.removeContainersWithDependentsInternal(ctx, conflicts)
+}
+
+// invisibleProjectContainersInternal lists project containers compose v5 cannot
+// see (podman-compose creations), optionally narrowed to the requested services.
+func (c *Client) invisibleProjectContainersInternal(ctx context.Context, projectName string, services []string) ([]container.Summary, error) {
+	containers, err := c.projectContainersInternal(ctx, projectName)
+	if err != nil {
+		return nil, err
+	}
+	var out []container.Summary
+	for _, ctr := range containers {
+		if !podmanComposeInvisibleInternal(ctr) {
 			continue
 		}
-		if ctr, ok := byName[svc.ContainerName]; ok {
-			if err := c.stopAndRemoveContainerInternal(ctx, ctr); err != nil {
-				errs = append(errs, fmt.Errorf("remove conflicting container %s: %w", svc.ContainerName, err))
-			}
+		if len(services) > 0 && !serviceSelectedInternal(services, ctr.Labels[api.ServiceLabel]) {
+			continue
 		}
+		out = append(out, ctr)
 	}
-	return errors.Join(errs...)
+	return out, nil
+}
+
+// composeContainerSummaryInternal renders a Docker container summary in the
+// shape compose's Ps returns so the invisible containers can be merged into it.
+func composeContainerSummaryInternal(c container.Summary) api.ContainerSummary {
+	publishers := make(api.PortPublishers, 0, len(c.Ports))
+	for _, p := range c.Ports {
+		publishers = append(publishers, api.PortPublisher{
+			TargetPort:    int(p.PrivatePort),
+			PublishedPort: int(p.PublicPort),
+			Protocol:      p.Type,
+		})
+	}
+	var health container.HealthStatus
+	if c.Health != nil {
+		health = c.Health.Status
+	}
+	return api.ContainerSummary{
+		ID:         c.ID,
+		Name:       canonicalContainerNameInternal(c),
+		Names:      c.Names,
+		Image:      c.Image,
+		Project:    docker.ComposeProjectLabel(c.Labels),
+		Service:    docker.ComposeServiceLabel(c.Labels),
+		State:      c.State,
+		Status:     c.Status,
+		Health:     health,
+		Publishers: publishers,
+		Labels:     c.Labels,
+	}
+}
+
+// detectEngineInternal resolves the connected engine, reporting the detection
+// error so callers can decide whether to degrade gracefully.
+func detectEngineInternal(ctx context.Context, apiClient client.APIClient) (compat.EngineCompatibilityInfo, error) {
+	serverVersion, err := apiClient.ServerVersion(ctx, client.ServerVersionOptions{})
+	if err != nil {
+		return compat.EngineCompatibilityInfo{}, err
+	}
+	infoResult, err := apiClient.Info(ctx, client.InfoOptions{})
+	if err != nil {
+		return compat.EngineCompatibilityInfo{}, err
+	}
+	return compat.DetectEngineCompatibility(serverVersion, infoResult.Info), nil
+}
+
+// mirrorPodmanComposeLabelsInternal stamps the podman-compose identity labels
+// Arcane can authoritatively know on the services about to be created, so Podman
+// tooling and `podman-compose ps/down` recognise them. It deliberately does not
+// fabricate io.podman.compose.config-hash, which podman-compose derives from its
+// own normalized model.
+func mirrorPodmanComposeLabelsInternal(projectName string, proj *composetypes.Project) {
+	systemdUnit := "podman-compose@" + projectName + ".service"
+	for name, svc := range proj.Services {
+		svc.CustomLabels = svc.CustomLabels.
+			Add(podmanComposeProjectLabelInternal, projectName).
+			Add(podmanComposeServiceLabelInternal, name).
+			Add(podmanSystemdUnitLabelInternal, systemdUnit)
+		proj.Services[name] = svc
+	}
+}
+
+// mirrorPodmanComposeLabelsForClientInternal mirrors labels only on the Podman
+// engine, leaving Docker deployments untouched.
+func mirrorPodmanComposeLabelsForClientInternal(ctx context.Context, apiClient client.APIClient, projectName string, proj *composetypes.Project) {
+	engine, err := detectEngineInternal(ctx, apiClient)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to detect container engine; skipping podman-compose label mirroring", "error", err)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(engine.Name), "podman") {
+		mirrorPodmanComposeLabelsInternal(projectName, proj)
+	}
 }
 
 func ComposeRestart(ctx context.Context, proj *composetypes.Project, services []string) error {
@@ -290,12 +497,13 @@ func ComposeUp(ctx context.Context,
 	upOptions, startOptions := composeUpOptionsInternal(proj, services, removeOrphans, forceRecreate, waitTimeout, envOpts)
 
 	// podman-compose containers are invisible to compose v5's label filters
-	// (they lack the config-hash label): remove any whose name collides with a
-	// container_name about to be created, otherwise create fails with
-	// "name is already in use".
-	if err := c.removeInvisibleNameConflictsInternal(composeCtx, proj.Name, proj); err != nil {
+	// (they lack the config-hash and one-off labels). Remove the ones this
+	// deploy would collide with before creating anything, so `up` adopts them
+	// instead of running a duplicate set under Docker's naming.
+	if err := c.removeInvisibleContainerConflictsInternal(composeCtx, proj.Name, proj); err != nil {
 		return err
 	}
+	mirrorPodmanComposeLabelsForClientInternal(composeCtx, c.dockerCli.Client(), proj.Name, proj)
 
 	return c.svc.Up(composeCtx, proj, api.UpOptions{Create: upOptions, Start: startOptions})
 }
@@ -316,6 +524,11 @@ func ComposeCreate(ctx context.Context, proj *composetypes.Project, services []s
 		return err
 	}
 	defer func() { _ = c.Close() }()
+
+	if err := c.removeInvisibleContainerConflictsInternal(createCtx, selected.Name, selected); err != nil {
+		return err
+	}
+	mirrorPodmanComposeLabelsForClientInternal(createCtx, c.dockerCli.Client(), selected.Name, selected)
 
 	return c.svc.Create(createCtx, selected, api.CreateOptions{Services: services, Recreate: api.RecreateForce, RecreateDependencies: api.RecreateDiverged})
 }
@@ -361,7 +574,37 @@ func ComposePs(ctx context.Context, dockerHost string, proj *composetypes.Projec
 		return nil, err
 	}
 
-	return c.svc.Ps(ctx, proj.Name, api.PsOptions{All: all, Services: services})
+	summaries, err := c.svc.Ps(ctx, proj.Name, api.PsOptions{All: all, Services: services})
+	if err != nil {
+		return nil, err
+	}
+
+	// Compose v5's Ps filters out containers lacking the config-hash/one-off
+	// labels, so podman-compose containers would be reported as absent. Merge
+	// them back in so project status, dependencies, and details stay accurate.
+	invisible, invisibleErr := c.invisibleProjectContainersInternal(ctx, proj.Name, services)
+	if invisibleErr != nil {
+		slog.WarnContext(ctx, "failed to list podman-compose containers for compose ps", "projectName", proj.Name, "error", invisibleErr)
+		return summaries, nil
+	}
+	if len(invisible) == 0 {
+		return summaries, nil
+	}
+
+	seen := make(map[string]struct{}, len(summaries))
+	for _, summary := range summaries {
+		seen[summary.ID] = struct{}{}
+	}
+	for _, ctr := range invisible {
+		if _, ok := seen[ctr.ID]; ok {
+			continue
+		}
+		if !all && ctr.State != container.StateRunning {
+			continue
+		}
+		summaries = append(summaries, composeContainerSummaryInternal(ctr))
+	}
+	return summaries, nil
 }
 
 func ComposeGenerate(ctx context.Context, dockerHost, projectName string, containerIDs []string) (string, error) {
@@ -392,14 +635,26 @@ func ComposeDown(ctx context.Context, proj *composetypes.Project, removeVolumes 
 		return err
 	}
 	// podman-compose containers are invisible to compose v5's label filters:
-	// v5's down silently skips them, so remove the leftovers directly.
-	return c.removeInvisibleProjectContainersInternal(downCtx, proj.Name)
+	// v5's down silently skips them, so remove the leftovers directly. The same
+	// applies to the networks it created, and to its volumes on `down -v`.
+	cleanupErrs := []error{
+		c.removeInvisibleProjectContainersInternal(downCtx, proj.Name),
+		c.removeInvisibleProjectNetworksInternal(downCtx, proj.Name),
+	}
+	if removeVolumes {
+		cleanupErrs = append(cleanupErrs, c.removeInvisibleProjectVolumesInternal(downCtx, proj.Name))
+	}
+	return errors.Join(cleanupErrs...)
 }
 
 // ComposeLogs streams a project's logs through the compose service. The
 // one-shot client for this call is built with the log-parity wrapper so
 // non-TTY containers keep their stderr metadata; deploy, attach, and other
 // compose operations use plain clients.
+//
+// Compose v5's log filter hides podman-compose containers (they lack the
+// config-hash label), so their logs are streamed directly and merged into the
+// same project stream.
 func ComposeLogs(ctx context.Context, projectName string, out io.Writer, follow bool, tail, since string, timestamps bool) error {
 	c, err := NewClient(ctx, "", nil, nil, streamDemuxedLogsInternal)
 	if err != nil {
@@ -407,7 +662,70 @@ func ComposeLogs(ctx context.Context, projectName string, out io.Writer, follow 
 	}
 	defer func() { _ = c.Close() }()
 
-	return c.svc.Logs(ctx, projectName, &writerConsumer{out: out}, api.LogOptions{Follow: follow, Tail: tail, Since: since, Timestamps: timestamps})
+	consumer := &writerConsumer{out: out}
+	logOptions := api.LogOptions{Follow: follow, Tail: tail, Since: since, Timestamps: timestamps}
+
+	invisible, invisibleErr := c.invisibleProjectContainersInternal(ctx, projectName, nil)
+	if invisibleErr != nil {
+		slog.WarnContext(ctx, "failed to list podman-compose containers for compose logs", "projectName", projectName, "error", invisibleErr)
+	}
+	if len(invisible) == 0 {
+		return c.svc.Logs(ctx, projectName, consumer, logOptions)
+	}
+
+	composeErrCh := make(chan error, 1)
+	go func() {
+		composeErrCh <- c.svc.Logs(ctx, projectName, consumer, logOptions)
+	}()
+	directErr := c.streamContainerLogsInternal(ctx, invisible, consumer, follow, tail, since, timestamps)
+	return errors.Join(<-composeErrCh, directErr)
+}
+
+// streamContainerLogsInternal streams logs for the containers compose v5 cannot
+// see, writing through the shared consumer so podman-compose and compose
+// containers interleave as one project stream.
+func (c *Client) streamContainerLogsInternal(ctx context.Context, containers []container.Summary, consumer *writerConsumer, follow bool, tail, since string, timestamps bool) error {
+	apiClient := c.dockerCli.Client()
+	group, groupCtx := errgroup.WithContext(ctx)
+	for _, ctr := range containers {
+		group.Go(func() error {
+			return streamSingleContainerLogsInternal(groupCtx, apiClient, ctr, consumer, follow, tail, since, timestamps)
+		})
+	}
+	return group.Wait()
+}
+
+func streamSingleContainerLogsInternal(ctx context.Context, apiClient client.APIClient, ctr container.Summary, consumer *writerConsumer, follow bool, tail, since string, timestamps bool) error {
+	inspect, err := apiClient.ContainerInspect(ctx, ctr.ID, client.ContainerInspectOptions{})
+	if err != nil {
+		return err
+	}
+	isTTY := inspect.Container.Config != nil && inspect.Container.Config.Tty
+
+	logs, err := apiClient.ContainerLogs(ctx, ctr.ID, client.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     follow,
+		Tail:       tail,
+		Since:      since,
+		Timestamps: timestamps,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = logs.Close() }()
+
+	name := canonicalContainerNameInternal(ctr)
+	logsChan := make(chan string, 16)
+	streamErrCh := make(chan error, 1)
+	go func() {
+		streamErrCh <- docker.StreamContainerLogs(ctx, logs, logsChan, follow, isTTY)
+		close(logsChan)
+	}()
+	for line := range logsChan {
+		consumer.Log(name, line)
+	}
+	return <-streamErrCh
 }
 
 // ListGlobalComposeContainers lists every container carrying a compose

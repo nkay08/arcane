@@ -47,6 +47,8 @@ type DockerClientService struct {
 	settingsService *settings.SettingsService
 	clientVersion   string
 	clientLastProbe time.Time
+	engine          compat.EngineCompatibilityInfo
+	engineKnown     bool
 	mu              sync.Mutex
 	eventBus        *bus.DockerEventBus
 
@@ -180,11 +182,49 @@ func (s *DockerClientService) RefreshClient(ctx context.Context) error {
 	s.Client = cli
 	s.clientVersion = apiVersion
 	s.clientLastProbe = time.Now()
+	s.engine = compat.EngineCompatibilityInfo{}
+	s.engineKnown = false
 	s.mu.Unlock()
 
 	closeDockerClient(ctx, oldClient, "replaced")
 
 	return nil
+}
+
+// Engine returns the container engine behind the configured Docker host,
+// detecting and caching it on first use. Podman exposes a Docker-compatible API,
+// so engine-specific behavior must be gated on this value rather than assumed
+// to be Docker. Detection failures are not cached, so a later call retries.
+func (s *DockerClientService) Engine(ctx context.Context) (compat.EngineCompatibilityInfo, error) {
+	s.mu.Lock()
+	if s.engineKnown {
+		engine := s.engine
+		s.mu.Unlock()
+		return engine, nil
+	}
+	s.mu.Unlock()
+
+	dockerClient, err := s.GetClient(ctx)
+	if err != nil {
+		return compat.EngineCompatibilityInfo{}, err
+	}
+
+	serverVersion, err := dockerClient.ServerVersion(ctx, client.ServerVersionOptions{})
+	if err != nil {
+		return compat.EngineCompatibilityInfo{}, fmt.Errorf("failed to detect container engine version: %w", err)
+	}
+	infoResult, err := dockerClient.Info(ctx, client.InfoOptions{})
+	if err != nil {
+		return compat.EngineCompatibilityInfo{}, fmt.Errorf("failed to detect container engine info: %w", err)
+	}
+	engine := compat.DetectEngineCompatibility(serverVersion, infoResult.Info)
+
+	s.mu.Lock()
+	s.engine = engine
+	s.engineKnown = true
+	s.mu.Unlock()
+
+	return engine, nil
 }
 
 // DockerHost returns the configured DOCKER_HOST value.
@@ -200,6 +240,8 @@ func (s *DockerClientService) Close() {
 	s.mu.Lock()
 	oldClient := s.Client
 	s.Client = nil
+	s.engine = compat.EngineCompatibilityInfo{}
+	s.engineKnown = false
 	s.mu.Unlock()
 
 	closeDockerClient(context.Background(), oldClient, "cached") //nolint:forbidigo // Shutdown close runs without a request context.

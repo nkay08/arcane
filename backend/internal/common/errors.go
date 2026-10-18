@@ -72,6 +72,12 @@ var (
 			"image patching requires Docker's containerd image store; enable the containerd-snapshotter feature in daemon.json and restart Docker",
 		),
 	)
+	ErrPatchUnsupportedOnPodman = Classify(
+		ErrBadRequest,
+		errors.New(
+			"image patching is not supported on Podman; it requires Docker's containerd image store and BuildKit",
+		),
+	)
 	ErrPatchScanReportUnavailable              = Classify(ErrNotFound, errors.New("no stored scan report is available for this scan; re-scan the image or patch without a report"))
 	ErrPatchScanImageMismatch                  = Classify(ErrBadRequest, errors.New("the selected scan does not belong to this image"))
 	ErrContainerComposeManaged                 = Classify(ErrConflict, errors.New("container is managed by a compose project; edit it via the project editor"))

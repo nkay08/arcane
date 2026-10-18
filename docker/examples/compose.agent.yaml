@@ -1,3 +1,6 @@
+# Docker example for a direct agent. On Podman, mount
+# $XDG_RUNTIME_DIR/podman/podman.sock (rootless) or /run/podman/podman.sock
+# (rootful) in place of the Docker socket and add :z to bind mounts on SELinux.
 services:
   arcane-agent:
     image: ghcr.io/getarcaneapp/agent:latest

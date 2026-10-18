@@ -283,6 +283,31 @@ func TestEnsureRuntimeDockerConfigCreatesCustomDirectory(t *testing.T) {
 	require.Equal(t, customDir, cfg.DockerConfig)
 }
 
+func TestDockerSocketPathInternal(t *testing.T) {
+	tests := []struct {
+		name   string
+		host   string
+		want   string
+		wantOK bool
+	}{
+		{name: "defaults to the docker socket when unset", host: "", want: defaultDockerSocketPath, wantOK: true},
+		{name: "docker unix host", host: "unix:///var/run/docker.sock", want: "/var/run/docker.sock", wantOK: true},
+		{name: "podman rootful socket", host: "unix:///run/podman/podman.sock", want: "/run/podman/podman.sock", wantOK: true},
+		{name: "podman rootless socket", host: "unix:///run/user/1000/podman/podman.sock", want: "/run/user/1000/podman/podman.sock", wantOK: true},
+		{name: "tcp host has no socket path", host: "tcp://docker:2375", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path, ok := dockerSocketPathInternal(tt.host).Get()
+			require.Equal(t, tt.wantOK, ok)
+			if tt.wantOK {
+				require.Equal(t, tt.want, path)
+			}
+		})
+	}
+}
+
 func TestRuntimeIdentitySupplementaryGroups(t *testing.T) {
 	t.Run("maps default docker socket group when docker host unset", func(t *testing.T) {
 		groups := runtimeIdentitySupplementaryGroupsInternal(

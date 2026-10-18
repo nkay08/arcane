@@ -330,3 +330,65 @@ func newDockerPingTestServerWithHandler(t *testing.T, handler http.HandlerFunc) 
 
 	return server
 }
+
+func TestDockerClientService_EngineDetectsAndCaches(t *testing.T) {
+	tests := []struct {
+		name        string
+		versionJSON string
+		infoJSON    string
+		wantEngine  string
+	}{
+		{
+			name:        "docker",
+			versionJSON: `{"Platform":{"Name":"Docker Engine - Community"},"ApiVersion":"1.41"}`,
+			infoJSON:    `{"CgroupVersion":"2","OperatingSystem":"Ubuntu","ServerVersion":"27.0.0"}`,
+			wantEngine:  "docker",
+		},
+		{
+			name:        "podman",
+			versionJSON: `{"Platform":{"Name":"Podman Engine"},"ApiVersion":"1.41","Components":[{"Name":"Podman Engine","Version":"5.0.0"}]}`,
+			infoJSON:    `{"CgroupVersion":"2","OperatingSystem":"fedora","ServerVersion":"5.0.0"}`,
+			wantEngine:  "podman",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var infoCalls atomic.Int32
+			server := newDockerEngineTestServerInternal(t, tt.versionJSON, tt.infoJSON, &infoCalls)
+			svc := newDockerClientServiceForTestInternal(t, server.URL)
+			t.Cleanup(svc.Close)
+
+			engine, err := svc.Engine(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantEngine, engine.Name)
+
+			// The second call is served from the cache, so the daemon is not re-probed.
+			cached, err := svc.Engine(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, engine, cached)
+			assert.Equal(t, int32(1), infoCalls.Load())
+		})
+	}
+}
+
+func newDockerEngineTestServerInternal(t *testing.T, versionJSON, infoJSON string, infoCalls *atomic.Int32) *httptest.Server {
+	t.Helper()
+
+	return newDockerPingTestServerWithHandlerInternal(t, func(w http.ResponseWriter, r *http.Request) {
+		switch dockerTestPathInternal(r.URL.Path) {
+		case "/_ping":
+			w.Header().Set("Api-Version", "1.41")
+			w.WriteHeader(http.StatusOK)
+		case "/version":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(versionJSON))
+		case "/info":
+			infoCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(infoJSON))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}

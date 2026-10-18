@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
+	dockerInternal "github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/gitrepo"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/gitutil"
@@ -637,4 +639,41 @@ func TestAggregateImageBuildsMergesEnvironments(t *testing.T) {
 		assert.Empty(t, body.Data)
 		assert.Len(t, body.FailedEnvironments, 3)
 	})
+}
+
+func TestBuildService_BuildImage_ExplainsPodmanBuildKitRequirement(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch regexp.MustCompile(`^/v[0-9.]+`).ReplaceAllString(r.URL.Path, "") {
+		case "/_ping":
+			w.Header().Set("Api-Version", "1.41")
+			w.WriteHeader(http.StatusOK)
+		case "/version":
+			_, _ = w.Write([]byte(`{"Platform":{"Name":"Podman Engine"},"ApiVersion":"1.41"}`))
+		case "/info":
+			_, _ = w.Write([]byte(`{"CgroupVersion":"2","OperatingSystem":"fedora","ServerVersion":"5.0.0"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	dockerService := dockerInternal.NewDockerClientService(t.Context(), nil, &config.Config{DockerHost: server.URL}, nil)
+	t.Cleanup(dockerService.Close)
+
+	buildErr := errors.New("failed to connect to Docker BuildKit: dial unix unsupported")
+	svc := &BuildService{
+		dockerService: dockerService,
+		builder:       testBuildRecorder{err: buildErr},
+	}
+
+	_, err := svc.BuildImage(t.Context(), "0", types.BuildRequest{
+		ContextDir: "/builds/demo",
+		Dockerfile: "Dockerfile",
+		Tags:       []string{"demo:test"},
+		Provider:   "local",
+		Load:       true,
+	}, nil, "web", nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, buildErr)
+	assert.Contains(t, err.Error(), "Podman")
 }
