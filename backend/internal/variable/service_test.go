@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +29,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/kv"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/remenv"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 )
@@ -231,6 +234,78 @@ func TestWriteLocalEnvFile_PreservesExistingFileMode(t *testing.T) {
 	content, err := os.ReadFile(envPath)
 	require.NoError(t, err)
 	require.Contains(t, string(content), "A=2")
+}
+
+func TestWriteLocalEnvFile_FileModeLeavesFileUntouched(t *testing.T) {
+	service, _, projectsDir := setupVariableServiceTest(t)
+	ctx := t.Context()
+
+	require.NoError(t, service.settingsService.UpdateSetting(ctx, "variablesFileMode", "true"))
+	require.True(t, service.FileModeEnabled(ctx))
+
+	envPath := filepath.Join(projectsDir, ".env.global")
+	content := "DC_PATH_BASE=/home/data/server_base\n"
+	require.NoError(t, os.WriteFile(envPath, []byte(content), 0o600))
+
+	writeErr := service.WriteLocalEnvFile(ctx, []env.Variable{{Key: "OTHER", Value: "x"}})
+	require.ErrorIs(t, writeErr, common.ErrVariablesFileMode)
+
+	got, err := os.ReadFile(envPath)
+	require.NoError(t, err)
+	assert.Equal(t, content, string(got), "file mode must leave .env.global untouched")
+
+	_, err = service.CreateVariable(ctx, env.CreateGlobalVariableRequest{Key: "A", Value: "1"})
+	require.ErrorIs(t, err, common.ErrVariablesFileMode)
+
+	listed, err := service.ListVariables(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 1, "UI must see the file contents in file mode")
+	assert.Equal(t, "DC_PATH_BASE", listed[0].Key)
+	assert.Equal(t, "/home/data/server_base", listed[0].Value)
+}
+
+func TestReadLocalEnvFile_ResolvesValuesLikeDeployment(t *testing.T) {
+	service, _, projectsDir := setupVariableServiceTest(t)
+	ctx := t.Context()
+
+	content := strings.Join([]string{
+		"# global variables",
+		"BASE_DIR=/srv/app",
+		"export DATA_DIR=\"$BASE_DIR/data\"",
+		"OPTIONAL=${MISSING:-fallback}",
+		"INLINE=value # trailing comment",
+		"SINGLE='$BASE_DIR/literal'",
+		"VOLUME_DIR=${BASE_DIR}/volumes",
+		"",
+	}, "\n")
+	require.NoError(t, os.WriteFile(filepath.Join(projectsDir, ".env.global"), []byte(content), 0o600))
+
+	vars, err := service.ReadLocalEnvFile(ctx)
+	require.NoError(t, err)
+
+	got := make(map[string]string, len(vars))
+	for _, variable := range vars {
+		got[variable.Key] = variable.Value
+	}
+	assert.Equal(t, "/srv/app/data", got["DATA_DIR"])
+	assert.Equal(t, "fallback", got["OPTIONAL"])
+	assert.Equal(t, "value", got["INLINE"])
+	assert.Equal(t, "$BASE_DIR/literal", got["SINGLE"], "single quotes must suppress expansion")
+	assert.Equal(t, "/srv/app/volumes", got["VOLUME_DIR"])
+
+	keys := make([]string, 0, len(vars))
+	for _, variable := range vars {
+		keys = append(keys, variable.Key)
+	}
+	assert.Equal(t, slices.Sorted(maps.Keys(got)), keys, "variables are returned in key order")
+
+	// The variables API must present exactly what deployment interpolation sees.
+	loader := projects.NewEnvLoader(projectsDir, projectsDir, false)
+	envMap, _, err := loader.LoadEnvironment(ctx)
+	require.NoError(t, err)
+	for key, value := range got {
+		assert.Equal(t, envMap[key], value, "value for %s must match deployment interpolation", key)
+	}
 }
 
 func TestSyncEnvironment_LocalWritesEnvGlobalFile(t *testing.T) {

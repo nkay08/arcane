@@ -294,6 +294,7 @@ func DefaultSettingsConfig() *Settings {
 		ActivityHistoryMaxEntries:             SettingVariable{Value: "1000"},
 		MaxConcurrentActivities:               SettingVariable{Value: "5"},
 		AutoInjectEnv:                         SettingVariable{Value: "false"},
+		VariablesFileMode:                     SettingVariable{Value: "false"},
 		DefaultDeployPullPolicy:               SettingVariable{Value: "missing"},
 		ToolsImageRegistry:                    SettingVariable{Value: "ghcr.io"},
 		UpdateCheckRegistry:                   SettingVariable{Value: "auto"},

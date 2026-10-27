@@ -386,6 +386,7 @@ var expectedSettingOverrideKeys = []string{
 	"trivyServerUrl",
 	"updateCheckRegistry",
 	"upgradeLogRetentionDays",
+	"variablesFileMode",
 	"volumeHelperIdleTimeout",
 	"vulnerabilityScanEnabled",
 	"vulnerabilityScanInterval",

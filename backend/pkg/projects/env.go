@@ -115,6 +115,14 @@ func allowedProcessEnvInternal() EnvMap {
 	return envMap
 }
 
+// InterpolationProcessEnv returns the allowlisted process environment that
+// env-file and compose interpolation may read. Callers parsing an env file
+// outside EnvLoader should use it as the expansion context so the values they
+// present match what deployment actually resolves.
+func InterpolationProcessEnv() EnvMap {
+	return allowedProcessEnvInternal()
+}
+
 // LoadEnvironment loads and merges environment variables from all sources:
 // 1. Allowlisted process environment (TZ)
 // 2. Global .env.global file (from projects directory)

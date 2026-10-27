@@ -1,8 +1,6 @@
 package variable
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json/v2"
 	"errors"
@@ -80,7 +78,19 @@ func NewVariableService(db *database.DB, environmentService *environment.Environ
 	return service
 }
 
+// FileModeEnabled reports whether the .env.global file in the projects directory
+// is the single source of truth for the local environment. When enabled Arcane
+// reads the file for interpolation but never writes it: the legacy import,
+// local materialization, and variable mutations are all disabled.
+func (s *VariableService) FileModeEnabled(ctx context.Context) bool {
+	return s.settingsService.GetBoolSetting(ctx, "variablesFileMode", false)
+}
+
 func (s *VariableService) ListVariables(ctx context.Context) ([]env.GlobalVariable, error) {
+	if s.FileModeEnabled(ctx) {
+		return s.listFileModeVariablesInternal(ctx)
+	}
+
 	variables, err := s.loadVariablesInternal(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve global variables: %w", err)
@@ -93,7 +103,37 @@ func (s *VariableService) ListVariables(ctx context.Context) ([]env.GlobalVariab
 	return result, nil
 }
 
+// listFileModeVariablesInternal presents the .env.global file contents through
+// the variables API so the UI keeps showing the effective values while file
+// mode is enabled. IDs are synthesized from keys; the rows are not editable
+// (mutations are rejected while file mode is on).
+func (s *VariableService) listFileModeVariablesInternal(ctx context.Context) ([]env.GlobalVariable, error) {
+	vars, err := s.ReadLocalEnvFile(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve global variables: %w", err)
+	}
+
+	result := make([]env.GlobalVariable, 0, len(vars))
+	now := time.Now().UTC()
+	for _, variable := range vars {
+		result = append(result, env.GlobalVariable{
+			ID:              variable.Key,
+			Key:             variable.Key,
+			Value:           variable.Value,
+			IsSecret:        false,
+			AllEnvironments: true,
+			EnvironmentIDs:  nil,
+			CreatedAt:       now,
+		})
+	}
+	return result, nil
+}
+
 func (s *VariableService) CreateVariable(ctx context.Context, req env.CreateGlobalVariableRequest) (*env.GlobalVariable, error) {
+	if s.FileModeEnabled(ctx) {
+		return nil, common.Classify(common.ErrVariablesFileMode, errors.New("variables file mode is enabled; edit .env.global directly"))
+	}
+
 	key := strings.TrimSpace(req.Key)
 	if !envKeyPattern.MatchString(key) {
 		return nil, common.Classify(common.ErrInvalidEnvKey, fmt.Errorf("invalid env key %q (must match [A-Za-z_][A-Za-z0-9_]*)", key))
@@ -138,6 +178,10 @@ func (s *VariableService) CreateVariable(ctx context.Context, req env.CreateGlob
 }
 
 func (s *VariableService) UpdateVariable(ctx context.Context, id string, req env.UpdateGlobalVariableRequest) (*env.GlobalVariable, error) {
+	if s.FileModeEnabled(ctx) {
+		return nil, common.Classify(common.ErrVariablesFileMode, errors.New("variables file mode is enabled; edit .env.global directly"))
+	}
+
 	var variable GlobalVariable
 	if err := s.db.WithContext(ctx).Preload("Environments").First(&variable, "id = ?", id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -252,6 +296,10 @@ func (s *VariableService) resolveUpdatedScopeInternal(ctx context.Context, varia
 }
 
 func (s *VariableService) DeleteVariable(ctx context.Context, id string) error {
+	if s.FileModeEnabled(ctx) {
+		return common.Classify(common.ErrVariablesFileMode, errors.New("variables file mode is enabled; edit .env.global directly"))
+	}
+
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Delete(&GlobalVariable{}, "id = ?", id)
 		if result.Error != nil {
@@ -339,6 +387,10 @@ func (s *VariableService) syncEnvironmentInternal(ctx context.Context, envID str
 	}
 
 	if envID == environment.LocalEnvironmentID {
+		if s.FileModeEnabled(ctx) {
+			// The file is the source of truth; there is nothing to materialize.
+			return nil
+		}
 		return s.WriteLocalEnvFile(ctx, vars)
 	}
 
@@ -370,9 +422,15 @@ func (s *VariableService) syncTargetsInternal(ctx context.Context) []environment
 		slog.ErrorContext(ctx, "Failed to list environments for global variable sync", "error", err)
 		remotes = nil
 	}
-	return append([]environment.Environment{{ID: environment.LocalEnvironmentID}}, slices.DeleteFunc(remotes, func(remote environment.Environment) bool {
+	remotes = slices.DeleteFunc(remotes, func(remote environment.Environment) bool {
 		return strings.TrimSpace(kit.FromPtr(remote.AccessToken)) == ""
-	})...)
+	})
+	if s.FileModeEnabled(ctx) {
+		// The local .env.global is the source of truth; never materialize the
+		// database set into it. Remote environments keep receiving pushes.
+		return remotes
+	}
+	return append([]environment.Environment{{ID: environment.LocalEnvironmentID}}, remotes...)
 }
 
 // SyncAll pushes the effective variable set to the local environment and every
@@ -499,46 +557,19 @@ func (s *VariableService) ReadLocalEnvFile(ctx context.Context) ([]env.Variable,
 		return nil, fmt.Errorf("failed to open global variables file: %w", err)
 	}
 
-	vars := []env.Variable{}
-	scanner := bufio.NewScanner(bytes.NewReader(content))
-	lineNum := 0
-
-	for scanner.Scan() {
-		lineNum++
-		line := strings.TrimSpace(scanner.Text())
-
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			slog.WarnContext(ctx, "Skipping invalid line in global variables file",
-				"line", lineNum,
-				"content", line)
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		if len(value) >= 2 {
-			if (strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) ||
-				(strings.HasPrefix(value, `'`) && strings.HasSuffix(value, `'`)) {
-				value = value[1 : len(value)-1]
-			}
-		}
-
-		vars = append(vars, env.Variable{
-			Key:   key,
-			Value: value,
-		})
+	// Parse with the same dotenv semantics deployments use, so values shown in
+	// the variables UI are expanded exactly as compose interpolation sees them:
+	// references to earlier keys, quoting, export prefixes, and inline comments.
+	values, err := projects.ParseProjectEnvContent(string(content), projects.InterpolationProcessEnv())
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse global variables file: %w", err)
 	}
 
-	if readVariablesErr := scanner.Err(); readVariablesErr != nil {
-		return nil, fmt.Errorf("error reading global variables file: %w", readVariablesErr)
+	keys := slices.Sorted(maps.Keys(values))
+	vars := make([]env.Variable, 0, len(keys))
+	for _, key := range keys {
+		vars = append(vars, env.Variable{Key: key, Value: values[key]})
 	}
-
 	return vars, nil
 }
 
@@ -546,6 +577,11 @@ func (s *VariableService) WriteLocalEnvFile(ctx context.Context, vars []env.Vari
 	envPath, err := s.localEnvFilePathInternal(ctx)
 	if err != nil {
 		return err
+	}
+
+	if s.FileModeEnabled(ctx) {
+		slog.DebugContext(ctx, "variables file mode enabled; leaving .env.global untouched", "path", envPath)
+		return common.Classify(common.ErrVariablesFileMode, errors.New("variables file mode is enabled; edit .env.global directly"))
 	}
 
 	// The data directory is the confinement root for the write, so it is created
@@ -598,6 +634,11 @@ func (s *VariableService) WriteLocalEnvFile(ctx context.Context, vars []env.Vari
 // as all-environment readable variables before the first materialization
 // overwrites the file. Runs once, guarded by a KV flag.
 func (s *VariableService) ImportLegacyLocalEnvFile(ctx context.Context) error {
+	if s.FileModeEnabled(ctx) {
+		slog.DebugContext(ctx, "variables file mode enabled; skipping legacy global variables import")
+		return nil
+	}
+
 	flag := globalVariablesImportedKVPrefix + environment.LocalEnvironmentID
 	imported, err := s.kvService.GetBool(ctx, flag, false)
 	if err != nil {
@@ -806,7 +847,7 @@ func replaceVariableScopeRowsInternal(tx *gorm.DB, variableID string, envIDs []s
 }
 
 func wrapVariableMutationErrorInternal(err error) error {
-	if err == nil || errors.Is(err, common.ErrGlobalVariableConflict) || errors.Is(err, common.ErrGlobalVariableNotFound) || errors.Is(err, common.ErrInvalidEnvKey) {
+	if err == nil || errors.Is(err, common.ErrGlobalVariableConflict) || errors.Is(err, common.ErrGlobalVariableNotFound) || errors.Is(err, common.ErrInvalidEnvKey) || errors.Is(err, common.ErrVariablesFileMode) {
 		return err
 	}
 	return fmt.Errorf("failed to update global variables: %w", err)
