@@ -102,6 +102,65 @@ func TestComposeLogsMarksStderrWithoutChangingComposeOptions(t *testing.T) {
 	assert.NotContains(t, query, "tail=")
 }
 
+func TestComposeLogsStreamsPodmanComposeContainers(t *testing.T) {
+	const (
+		project   = "podmandemo"
+		container = "aaaabbbbccccddddeeeeffff00001111"
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := regexp.MustCompile(`^/v[0-9.]+`).ReplaceAllString(r.URL.Path, "")
+
+		switch path {
+		case "/_ping":
+			w.Header().Set("Api-Version", "1.47")
+			w.WriteHeader(http.StatusOK)
+		case "/containers/json":
+			w.Header().Set("Content-Type", "application/json")
+			// Compose v5 filters on the config-hash label; podman-compose
+			// containers lack it, so its query must see nothing.
+			if strings.Contains(r.URL.Query().Get("filters"), "com.docker.compose.config-hash") {
+				_, _ = w.Write([]byte("[]"))
+				return
+			}
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"Id":     container,
+					"Names":  []string{"/" + project + "_web_1"},
+					"Image":  "nginx",
+					"State":  "running",
+					"Status": "Up",
+					"Labels": map[string]string{
+						"com.docker.compose.project": project,
+						"com.docker.compose.service": "web",
+					},
+				},
+			}))
+		case "/containers/" + container + "/json":
+			writeComposeInspectJSONInternal(t, w, container, "web", false)
+		case "/containers/" + container + "/logs":
+			w.Header().Set("Content-Type", "application/vnd.docker.multiplexed-stream")
+			_, err := w.Write(bytes.Join([][]byte{
+				frameLogEntryInternal(stdcopy.Stdout, []byte("podman stdout\n")),
+				frameLogEntryInternal(stdcopy.Stderr, []byte("podman stderr\n")),
+			}, nil))
+			require.NoError(t, err)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("DOCKER_HOST", "tcp://"+strings.TrimPrefix(server.URL, "http://"))
+
+	out := &bytes.Buffer{}
+	require.NoError(t, ComposeLogs(t.Context(), project, out, false, "all", "", false))
+
+	body := out.String()
+	assert.Contains(t, body, "podman stdout")
+	assert.Contains(t, body, "[STDERR] podman stderr")
+}
+
 func writeComposeInspectJSONInternal(t *testing.T, w http.ResponseWriter, containerID, serviceName string, tty bool) {
 	t.Helper()
 
